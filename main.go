@@ -8,12 +8,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/apimachinery/pkg/fields"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"time"
 	"k8s.io/api/core/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	"log"
 	"github.com/ozanichkovsky/kubernetes-controller-example/slack"
 	"sync"
+	"strings"
+	"strconv"
 )
 
 func main() {
@@ -41,6 +44,7 @@ func main() {
 	}
 	slackClient.SetChannelChan(ns)
 	slackClient.SetMessageChan(messages)
+	incoming := slackClient.GetIncomingMessagesChan()
 
 	wg.Add(1)
 	go func() {
@@ -57,6 +61,12 @@ func main() {
 	go func() {
 		defer wg.Done()
 		slackClient.Proceed()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scaleDeployments(clientset, incoming, messages)
 	}()
 	wg.Wait()
 }
@@ -108,7 +118,7 @@ func watchDeployments(clientset *kubernetes.Clientset, messages chan<- slack.Mes
 		deployment := obj.(*appsv1.Deployment)
 		messages <- slack.Message{
 			Channel: deployment.Namespace,
-			Message: fmt.Sprintf("Deployment %s with scale %d created", deployment.Name, deployment.Status.Replicas),
+			Message: fmt.Sprintf("Deployment `%s` with scale `%d` created", deployment.Name, deployment.Status.Replicas),
 		}
 	}
 
@@ -121,7 +131,7 @@ func watchDeployments(clientset *kubernetes.Clientset, messages chan<- slack.Mes
 
 		messages <- slack.Message{
 			Channel: newDeployment.Namespace,
-			Message: fmt.Sprintf("Deployment %s scaled from %d to %d", newDeployment.Name, oldDeployment.Status.Replicas, newDeployment.Status.Replicas),
+			Message: fmt.Sprintf("Deployment `%s` scaled from `%d` to `%d`", newDeployment.Name, oldDeployment.Status.Replicas, newDeployment.Status.Replicas),
 		}
 	}
 
@@ -137,4 +147,57 @@ func watchDeployments(clientset *kubernetes.Clientset, messages chan<- slack.Mes
 
 	stop := make(chan struct{})
 	go controller.Run(stop)
+}
+
+func scaleDeployments(clientset *kubernetes.Clientset, incoming <-chan slack.Message, outgoing chan<- slack.Message) {
+	for m := range incoming {
+		parts := strings.Split(m.Message, " ")
+		formatError := "Use `@testbot scale deployment-name 4` format"
+		if len(parts) < 4 || len(parts) > 4 {
+			outgoing <- slack.Message{
+				ChannelId: m.ChannelId,
+				Message:   formatError,
+			}
+		}
+		if parts[1] != "scale" {
+			outgoing <- slack.Message{
+				ChannelId: m.ChannelId,
+				Message:   formatError,
+			}
+		}
+		replicas, err := strconv.Atoi(parts[3])
+		replicasInt32 := int32(replicas)
+		if err != nil {
+			outgoing <- slack.Message{
+				ChannelId: m.ChannelId,
+				Message:   formatError,
+			}
+		}
+
+		deploymentName := parts[2]
+		deploymentsClient := clientset.AppsV1().Deployments(m.Channel)
+		deployment, err := deploymentsClient.Get(deploymentName, metav1.GetOptions{})
+
+		if err != nil {
+			outgoing <- slack.Message{
+				ChannelId: m.ChannelId,
+				Message:   fmt.Sprintf("Couldn't get deployment `%s`: %v", deploymentName, err),
+			}
+		}
+
+		deployment.Spec.Replicas = &replicasInt32
+
+		_, updateErr := deploymentsClient.Update(deployment)
+		if updateErr != nil {
+			outgoing <- slack.Message{
+				ChannelId: m.ChannelId,
+				Message:   fmt.Sprintf("Was not able to update deployment `%s`: %v", deploymentName, updateErr),
+			}
+		}
+
+		outgoing <- slack.Message{
+			ChannelId: m.ChannelId,
+			Message:   fmt.Sprintf("Scaling deployment `%s` to `%d` replicas...", deploymentName, replicas),
+		}
+	}
 }

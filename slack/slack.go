@@ -138,14 +138,13 @@ func (s *Slack) sendMessage(message Message) {
 		s.mux.RLock()
 		var ok bool
 		channel, ok = s.channelCache[message.Channel]
-		fmt.Printf("Channel: %v\n", message.Channel)
 		s.mux.RUnlock()
 		if !ok {
 			return
 		}
+	} else {
+		channel = message.ChannelId
 	}
-
-	channel = message.ChannelId
 
 	msg := slack.OutgoingMessage{
 		Channel: channel,
@@ -153,7 +152,6 @@ func (s *Slack) sendMessage(message Message) {
 		Type:    "message",
 	}
 
-	fmt.Printf("%+v\n", msg)
 	s.rtmBot.SendMessage(&msg)
 }
 
@@ -198,10 +196,16 @@ func (s *Slack) Proceed() {
 					prefix := fmt.Sprintf("<@%s> ", info.User.ID)
 
 					if ev.User != info.User.ID && strings.HasPrefix(ev.Text, prefix) {
+						channelInfo, err := s.rtmBot.GetChannelInfo(ev.Channel)
+						if err != nil {
+							fmt.Printf("Got error: %v", err)
+						}
+
 						s.rtmBot.SendMessage(s.rtm.NewOutgoingMessage("Processing your message", ev.Channel))
 						s.incoming <- Message{
 							ChannelId: ev.Channel,
 							Message: ev.Text,
+							Channel: channelInfo.Name,
 						}
 					}
 
@@ -213,8 +217,10 @@ func (s *Slack) Proceed() {
 
 				case *slack.ConnectionErrorEvent:
 					fmt.Printf("Invalid credentials %T\n", ev)
+				case *slack.AckErrorEvent:
+					fmt.Printf("Error: %s\n", ev.Error())
 				default:
-					fmt.Printf("Type %T\n", ev)
+					fmt.Printf("Type %T: \n", ev)
 				}
 			}
 		}
